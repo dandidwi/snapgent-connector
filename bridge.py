@@ -193,7 +193,7 @@ async def _perform_ws_handshake(
             b"Upgrade: websocket\r\n"
             b"Connection: Upgrade\r\n"
             b"Content-Type: text/plain\r\n"
-            f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+            + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
             + body
         )
         writer.write(resp)
