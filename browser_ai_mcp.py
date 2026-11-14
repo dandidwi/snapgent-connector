@@ -29,6 +29,10 @@ except AttributeError:
 
 
 ROOT = Path(__file__).resolve().parent
+# If running as a frozen executable inside dist/, move up to the project root
+# so we can find snapgent-extension/runtime_ports.json.
+if getattr(sys, "frozen", False) and (ROOT.parent / "snapgent-extension").exists():
+    ROOT = ROOT.parent
 RUNTIME_PORTS_PATH = ROOT / "snapgent-extension" / "runtime_ports.json"
 DEFAULT_API_PORT = 11434
 # Browser replies can be slow. The bridge waits up to ~240s for the browser tab,
@@ -247,7 +251,7 @@ def handle_request(request: Dict[str, Any]) -> None:
     })
 
 
-if __name__ == "__main__":
+def main() -> None:
     for line in sys.stdin:
         stripped = line.strip()
         if not stripped:
@@ -258,3 +262,7 @@ if __name__ == "__main__":
             continue
         if isinstance(request, dict):
             handle_request(request)
+
+
+if __name__ == "__main__":
+    main()

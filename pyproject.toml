@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snapgent-browserai"
+version = "1.0.0"
+description = "MCP server that exposes a local browser AI chat (Gemini/ChatGPT/Claude/DeepSeek) as an OpenAI/Ollama-compatible model via the Snapgent bridge."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Dandi Dwi" },
+]
+keywords = ["mcp", "ollama", "ai", "browser", "snapgent"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/dandidwi/snapgent-connector"
+
+[project.scripts]
+snapgent-browserai = "browser_ai_mcp:main"
+
+[tool.setuptools]
+py-modules = ["browser_ai_mcp"]
