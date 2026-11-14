@@ -7,8 +7,21 @@
 // Contract with content.js: every sendMessage ALWAYS gets a response object,
 // even when the bridge is offline. The agentic loop must never hang waiting.
 
-const PORT = 17613;
-const URL = `ws://127.0.0.1:${PORT}`;
+const DEFAULT_PORT = 37613;
+let activePort = DEFAULT_PORT;
+
+async function resolveBridgeUrl() {
+  try {
+    const res = await fetch(chrome.runtime.getURL("runtime_ports.json"), { cache: "no-store" });
+    if (res.ok) {
+      const data = await res.json();
+      if (data && Number.isInteger(data.bridge_port)) {
+        activePort = data.bridge_port;
+      }
+    }
+  } catch {}
+  return `ws://127.0.0.1:${activePort}`;
+}
 
 // Chat sites where a snapgentV3 provider content script runs. Status pushes go
 // to every tab matching these. Add the new provider's URL pattern here (and in
@@ -58,13 +71,14 @@ function log(...a) {
 }
 
 // ── WebSocket lifecycle ─────────────────────────────────────────────────
-function connect() {
+async function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
   clearTimeout(reconnectTimer);
+  const targetUrl = await resolveBridgeUrl();
   try {
-    ws = new WebSocket(URL);
+    ws = new WebSocket(targetUrl);
   } catch (e) {
     log("WebSocket ctor failed", e);
     scheduleReconnect();
@@ -269,6 +283,50 @@ function handleBridgeMessage(msg) {
     resolvePending(msg.id, { ok: false, error: msg.error });
     return;
   }
+  if (msg.type === "api_completion") {
+    handleApiCompletion(msg);
+    return;
+  }
+}
+
+function handleApiCompletion(msg) {
+  const reqId = msg.id;
+  const prompt = String(msg.prompt || "");
+  const wantedModel = String(msg.model || "auto").toLowerCase();
+  chrome.tabs.query({ url: PROVIDER_URLS }, (tabs) => {
+    if (!tabs || !tabs.length) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "api_completion_result", id: reqId, ok: false, error: "No AI chat tab open in browser. Open Gemini, ChatGPT, Claude, or DeepSeek first." }));
+      }
+      return;
+    }
+    let chosen = null;
+    if (wantedModel && wantedModel !== "auto" && wantedModel !== "snapgent-browser") {
+      const keyword = wantedModel.replace(/-web$/i, "");
+      chosen = tabs.find((t) => (t.url || "").toLowerCase().includes(keyword) || (t.title || "").toLowerCase().includes(keyword));
+    }
+    if (!chosen) {
+      chosen = tabs.find((t) => t.active) || tabs[0];
+    }
+    chrome.tabs.sendMessage(chosen.id, { type: "zs-api-completion", prompt }, (resp) => {
+      if (chrome.runtime.lastError || !resp) {
+        const errMsg = chrome.runtime.lastError ? chrome.runtime.lastError.message : "Content script did not respond. Reload the AI chat tab.";
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "api_completion_result", id: reqId, ok: false, error: errMsg }));
+        }
+        return;
+      }
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: "api_completion_result",
+          id: reqId,
+          ok: !!resp.ok,
+          text: resp.text || "",
+          error: resp.error || "",
+        }));
+      }
+    });
+  });
 }
 
 function resolvePending(id, value) {

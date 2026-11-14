@@ -29,6 +29,7 @@ CONFIG_PATH = ROOT / "config.json"
 LOG_PATH = ROOT / "logs" / "bridge_debug.log"
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("ZS_BRIDGE_PORT", "17613"))
+API_PORT = int(os.environ.get("ZS_API_PORT", "11434"))
 MCP_PROTOCOL_VERSION = "2024-11-05"
 BRIDGE_VERSION = "3.9.4"
 MAX_LOG_CHARS = 1000
@@ -285,6 +286,12 @@ class Bridge:
         self._client_lock = asyncio.Lock()
         self._catalog: List[Dict[str, Any]] = []
         self._last_studio: Optional[bool] = None
+        self._api_pending: Dict[str, asyncio.Future] = {}
+        self._api_next_id = 1
+        self._api_lock = asyncio.Lock()
+        self.active_providers: List[str] = []
+        self.api_requests_handled: int = 0
+        self.api_last_client: str = "None yet"
 
     def load_config(self) -> Dict[str, Dict[str, Any]]:
         if not CONFIG_PATH.exists():
@@ -461,11 +468,49 @@ class Bridge:
             await self._change_server(websocket, request, remove=False)
         elif kind == "remove_server":
             await self._change_server(websocket, request, remove=True)
+        elif kind == "providers_update":
+            providers = request.get("providers")
+            if isinstance(providers, list):
+                self.active_providers = [str(p) for p in providers if p]
+        elif kind == "api_completion_result":
+            req_id = str(request.get("id", ""))
+            fut = self._api_pending.get(req_id)
+            if fut and not fut.done():
+                if request.get("ok"):
+                    fut.set_result(str(request.get("text", "")))
+                else:
+                    fut.set_exception(RuntimeError(str(request.get("error") or "Browser completion failed")))
         else:
             await self._send_client(
                 websocket,
                 {"type": "error", "id": request_id, "error": f"Unknown bridge request: {kind}"},
             )
+
+    async def request_browser_completion(self, prompt: str, model: str = "auto", timeout: float = 240.0) -> str:
+        async with self._api_lock:
+            async with self._client_lock:
+                clients = list(self.clients)
+            if not clients:
+                raise RuntimeError("No browser extension connected to snapgent bridge. Open an AI chat tab in Chrome first.")
+            req_id = f"api_{self._api_next_id}"
+            self._api_next_id += 1
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+            self._api_pending[req_id] = fut
+            try:
+                await self._send_client(
+                    clients[0],
+                    {
+                        "type": "api_completion",
+                        "id": req_id,
+                        "prompt": prompt,
+                        "model": model,
+                        "timeout": int(timeout * 1000),
+                    },
+                )
+                return await asyncio.wait_for(fut, timeout=timeout)
+            finally:
+                self._api_pending.pop(req_id, None)
 
     async def _call_tool(self, websocket: Any, request: Dict[str, Any]) -> None:
         request_id = request.get("id")
@@ -681,6 +726,276 @@ def subprocess_run(command: List[str], timeout: int) -> str:
     return result.stdout
 
 
+def _compile_api_prompt(messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None) -> str:
+    parts: List[str] = []
+    sys_msgs = [m.get("content", "") for m in messages if m.get("role") == "system" and m.get("content")]
+    if sys_msgs:
+        parts.append("=== SYSTEM INSTRUCTIONS ===\n" + "\n\n".join(str(s) for s in sys_msgs))
+    if tools:
+        tool_specs = []
+        for t in tools:
+            fn = t.get("function") if isinstance(t.get("function"), dict) else t
+            if isinstance(fn, dict) and fn.get("name"):
+                tool_specs.append({
+                    "name": fn.get("name"),
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                })
+        if tool_specs:
+            parts.append(
+                "=== AVAILABLE TOOLS ===\n"
+                "You have access to the following tools. To call a tool, respond ONLY with a fenced JSON block in this exact format:\n"
+                "```json\n"
+                "{\"tool_calls\":[{\"name\":\"exact_tool_name\",\"arguments\":{...}}]}\n"
+                "```\n"
+                "If you do not need to call a tool, reply normally in plain text.\n\n"
+                + json.dumps(tool_specs, ensure_ascii=False, indent=2)
+            )
+    convo: List[str] = []
+    for m in messages:
+        role = m.get("role", "user")
+        if role == "system":
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            content = "\n".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
+        content_str = str(content or "")
+        if role == "tool":
+            tc_id = m.get("tool_call_id") or m.get("name") or "tool"
+            convo.append(f"[TOOL OUTPUT ({tc_id})]:\n{content_str}")
+        elif role == "assistant":
+            tcs = m.get("tool_calls")
+            if tcs:
+                convo.append(f"[ASSISTANT TOOL CALL]:\n{json.dumps(tcs, ensure_ascii=False)}")
+            elif content_str:
+                convo.append(f"[ASSISTANT]:\n{content_str}")
+        else:
+            convo.append(f"[USER]:\n{content_str}")
+    if convo:
+        parts.append("=== CONVERSATION ===\n" + "\n\n".join(convo))
+    parts.append("=== YOUR RESPONSE ===")
+    return "\n\n".join(parts)
+
+
+def _parse_api_response(raw_text: str) -> Tuple[Optional[str], Optional[List[Dict[str, Any]]]]:
+    text = (raw_text or "").strip()
+    fenced = re.findall(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
+    candidates = fenced if fenced else ([text] if text.startswith("{") and text.endswith("}") else [])
+    for cand in candidates:
+        try:
+            obj = json.loads(cand)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list) and obj["tool_calls"]:
+            parsed_calls = []
+            for idx, item in enumerate(obj["tool_calls"]):
+                if not isinstance(item, dict):
+                    continue
+                fn_obj = item.get("function") if isinstance(item.get("function"), dict) else item
+                name = fn_obj.get("name") or item.get("command")
+                args = fn_obj.get("arguments") if "arguments" in fn_obj else item.get("params", {})
+                if not isinstance(name, str) or not name:
+                    continue
+                args_str = args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False)
+                parsed_calls.append({
+                    "id": f"call_{int(time.time()*1000)}_{idx}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": args_str},
+                })
+            if parsed_calls:
+                return None, parsed_calls
+    return text, None
+
+
+async def _handle_http_client(bridge: Bridge, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        raw_head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=15)
+    except Exception:
+        writer.close()
+        return
+    head_text = raw_head.decode("utf-8", errors="replace")
+    lines = head_text.split("\r\n")
+    req_line = lines[0].split()
+    if len(req_line) < 2:
+        writer.close()
+        return
+    method, path = req_line[0].upper(), req_line[1].split("?", 1)[0]
+    headers: Dict[str, str] = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    content_len = int(headers.get("content-length", "0") or "0")
+    body_bytes = b""
+    if content_len > 0:
+        try:
+            body_bytes = await asyncio.wait_for(reader.readexactly(content_len), timeout=30)
+        except Exception:
+            writer.close()
+            return
+
+    async def send_json(status: int, payload: Any) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        status_text = {200: "OK", 400: "Bad Request", 404: "Not Found", 500: "Internal Server Error", 502: "Bad Gateway"}.get(status, "OK")
+        resp_head = (
+            f"HTTP/1.1 {status} {status_text}\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Headers: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("utf-8")
+        writer.write(resp_head + body)
+        await writer.drain()
+        writer.close()
+
+    if method == "OPTIONS":
+        await send_json(200, {"ok": True})
+        return
+
+    available_models = bridge.active_providers or ["snapgent-browser", "gemini-web", "chatgpt-web", "claude-web", "deepseek-web"]
+
+    if method == "GET" and path in ("/", "/api/version"):
+        await send_json(200, {
+            "status": "ok",
+            "version": BRIDGE_VERSION,
+            "service": "snapgent-local-ai",
+            "requests_handled": bridge.api_requests_handled,
+            "last_client": bridge.api_last_client,
+            "busy": bridge._api_lock.locked(),
+        })
+        return
+
+    if method == "GET" and path in ("/v1/models", "/models"):
+        now_ts = int(time.time())
+        await send_json(200, {
+            "object": "list",
+            "data": [{"id": m, "object": "model", "created": now_ts, "owned_by": "snapgent-browser"} for m in available_models],
+        })
+        return
+
+    if method == "GET" and path == "/api/tags":
+        await send_json(200, {
+            "models": [
+                {"name": f"{m}:latest", "model": f"{m}:latest", "modified_at": "2026-01-01T00:00:00Z", "size": 0, "digest": "snapgent"}
+                for m in available_models
+            ]
+        })
+        return
+
+    if method == "POST" and path in ("/v1/chat/completions", "/chat/completions", "/api/chat", "/api/generate"):
+        try:
+            payload = json.loads(body_bytes.decode("utf-8") or "{}")
+        except Exception:
+            await send_json(400, {"error": {"message": "Invalid JSON body"}})
+            return
+        model = str(payload.get("model") or "auto").replace(":latest", "")
+        stream = bool(payload.get("stream", False))
+        is_ollama = path.startswith("/api/")
+        if path == "/api/generate":
+            messages = []
+            if payload.get("system"):
+                messages.append({"role": "system", "content": payload["system"]})
+            messages.append({"role": "user", "content": payload.get("prompt", "")})
+        else:
+            messages = payload.get("messages") or []
+        tools = payload.get("tools")
+        ua = headers.get("user-agent", "").split("/")[0].strip()
+        bridge.api_last_client = ua or "External Agent"
+        compiled_prompt = _compile_api_prompt(messages, tools)
+        log(f"[local-api] {path} client={bridge.api_last_client} model={model} stream={stream} msgs={len(messages)} tools={len(tools) if tools else 0}")
+        try:
+            raw_reply = await bridge.request_browser_completion(compiled_prompt, model=model)
+            bridge.api_requests_handled += 1
+        except Exception as err:
+            log(f"[local-api] error: {err}")
+            await send_json(502, {"error": {"message": str(err), "type": "bridge_error"}})
+            return
+
+        content, tool_calls = _parse_api_response(raw_reply)
+        created = int(time.time())
+        chat_id = f"chatcmpl-snapgent-{created}"
+
+        if is_ollama:
+            ollama_msg: Dict[str, Any] = {"role": "assistant", "content": content or ""}
+            if tool_calls:
+                ollama_msg["tool_calls"] = [
+                    {"function": {"name": tc["function"]["name"], "arguments": json.loads(tc["function"]["arguments"])}}
+                    for tc in tool_calls
+                ]
+            if stream:
+                chunk = json.dumps({
+                    "model": model,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "message": ollama_msg,
+                    "response": content or "",
+                    "done": True,
+                    "done_reason": "stop",
+                }, ensure_ascii=False) + "\n"
+                raw_chunk = chunk.encode("utf-8")
+                writer.write((
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/x-ndjson\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    f"Content-Length: {len(raw_chunk)}\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("utf-8") + raw_chunk)
+                await writer.drain()
+                writer.close()
+                return
+            await send_json(200, {
+                "model": model,
+                "created_at": "2026-01-01T00:00:00Z",
+                "message": ollama_msg,
+                "response": content or "",
+                "done": True,
+                "done_reason": "stop",
+            })
+            return
+
+        if stream:
+            delta: Dict[str, Any] = {"role": "assistant"}
+            if tool_calls:
+                delta["tool_calls"] = [{**tc, "index": i} for i, tc in enumerate(tool_calls)]
+            else:
+                delta["content"] = content or ""
+            c1 = f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+            c2 = f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls' if tool_calls else 'stop'}]}, ensure_ascii=False)}\n\n"
+            c3 = "data: [DONE]\n\n"
+            sse_bytes = (c1 + c2 + c3).encode("utf-8")
+            writer.write((
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                f"Content-Length: {len(sse_bytes)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("utf-8") + sse_bytes)
+            await writer.drain()
+            writer.close()
+            return
+
+        msg_obj: Dict[str, Any] = {"role": "assistant", "content": content}
+        if tool_calls:
+            msg_obj["tool_calls"] = tool_calls
+        await send_json(200, {
+            "id": chat_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": msg_obj,
+                "finish_reason": "tool_calls" if tool_calls else "stop",
+            }],
+            "usage": {"prompt_tokens": len(compiled_prompt) // 4, "completion_tokens": len(raw_reply) // 4, "total_tokens": (len(compiled_prompt) + len(raw_reply)) // 4},
+        })
+        return
+
+    await send_json(404, {"error": {"message": f"Not found: {path}"}})
+
+
 async def run() -> None:
     if websockets is None:
         raise RuntimeError(
@@ -688,16 +1003,54 @@ async def run() -> None:
             f"'{sys.executable} -m pip install websockets'."
         )
     bridge = Bridge()
-    server = await websockets.serve(
-        bridge.handle_client,
-        HOST,
-        PORT,
-        max_size=50 * 1024 * 1024,
-        ping_interval=20,
-        ping_timeout=20,
-    )
+    active_ws_port = PORT
+    server = None
+    for offset in range(25):
+        candidate = PORT + offset
+        try:
+            server = await websockets.serve(
+                bridge.handle_client,
+                HOST,
+                candidate,
+                max_size=50 * 1024 * 1024,
+                ping_interval=20,
+                ping_timeout=20,
+            )
+            active_ws_port = candidate
+            break
+        except OSError:
+            log(f"[port-check] WS port {candidate} busy, trying {candidate + 1}...")
+    if server is None:
+        raise RuntimeError(f"Could not bind any WS port starting at {PORT}")
+
+    active_api_port = API_PORT
+    api_server = None
+    for offset in range(25):
+        candidate = API_PORT + offset
+        try:
+            api_server = await asyncio.start_server(
+                lambda r, w: _handle_http_client(bridge, r, w),
+                HOST,
+                candidate,
+            )
+            active_api_port = candidate
+            break
+        except OSError:
+            log(f"[port-check] API port {candidate} busy, trying {candidate + 1}...")
+    if api_server is None:
+        raise RuntimeError(f"Could not bind any HTTP API port starting at {API_PORT}")
+
+    try:
+        RUNTIME_PORTS_PATH.write_text(
+            json.dumps({"bridge_port": active_ws_port, "api_port": active_api_port}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        log(f"[warn] failed to write runtime_ports.json: {exc}")
+
     log(f"snapgent bridge v{BRIDGE_VERSION}")
-    log(f"listening on ws://{HOST}:{PORT} - load the extension and open a supported AI chat")
+    log(f"listening on ws://{HOST}:{active_ws_port} - load the extension and open a supported AI chat")
+    log(f"Local AI API (OpenAI & Ollama compatible) listening on http://{HOST}:{active_api_port}/v1")
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
     async def _startup_then_monitor() -> None:

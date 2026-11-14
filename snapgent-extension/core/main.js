@@ -871,6 +871,42 @@
     return { kind: "timeout" };
   }
 
+  // â”€â”€ Local API Worker Mode (OpenAI / Ollama proxy via browser tab) â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  let apiBusy = false;
+  try {
+    chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+      if (!msg || msg.type !== "zs-api-completion") return false;
+      (async () => {
+        if (apiBusy) {
+          sendResponse({ ok: false, error: "This browser tab is currently busy generating another API reply." });
+          return;
+        }
+        apiBusy = true;
+        setBackgroundSessions(true);
+        try {
+          const base = await submitAndGetBase(String(msg.prompt || ""), null);
+          const res = await waitForResponse(base);
+          if (res && res.kind === "text") {
+            sendResponse({ ok: true, text: res.text || "" });
+          } else if (res && res.kind === "tool" && Array.isArray(res.calls) && res.calls.length) {
+            sendResponse({ ok: true, text: JSON.stringify({ tool_calls: res.calls.map((c) => ({ name: c.tool, arguments: c.arguments || {} })) }) });
+          } else {
+            const raw = (P.readAssistant && P.readAssistant().reply) || "";
+            if (raw.trim()) sendResponse({ ok: true, text: raw });
+            else sendResponse({ ok: false, error: `Browser AI did not return text (${res ? res.kind : "unknown"})` });
+          }
+        } catch (err) {
+          sendResponse({ ok: false, error: String((err && err.message) || err) });
+        } finally {
+          apiBusy = false;
+        }
+      })();
+      return true;
+    });
+  } catch (e) {
+    console.warn("[snapgentV3] Could not attach API completion listener:", e);
+  }
+
   // ════════════════════════════════════════════════════════════════════════
   //  TOOL EXECUTION  (always returns a feedback string for the model)
   // ════════════════════════════════════════════════════════════════════════
