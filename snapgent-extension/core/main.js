@@ -881,6 +881,17 @@
           sendResponse({ ok: false, error: "This browser tab is currently busy generating another API reply." });
           return;
         }
+        // An Active agent session owns this tab's input and response stream. If
+        // we proceed while A.running is true, our submitAndGetBase/waitForResponse
+        // races the agent loop's own waitForResponse on the SAME tab: whichever
+        // consumes the stream first leaves the other waiting forever, so the MCP
+        // call (ask_browser_ai) hangs until the bridge times out. Fail fast with
+        // a clear, actionable error instead of hanging. Use a different AI chat
+        // tab, or stop the active session, then retry.
+        if (A.running) {
+          sendResponse({ ok: false, error: "This browser tab is running an active Snapgent agent session. Use a different AI chat tab, or stop the active session, then retry." });
+          return;
+        }
         apiBusy = true;
         setBackgroundSessions(true);
         try {

@@ -84,6 +84,22 @@ if ($usesBundledVscode) {
     }
 }
 
+# Configure Browser AI MCP
+$browserAiMcp = Join-Path $PSScriptRoot "browser_ai_mcp.py"
+if (Test-Path -LiteralPath $browserAiMcp -PathType Leaf) {
+    $browserAiServer = [pscustomobject]@{
+        command = "python"
+        args = @($browserAiMcp)
+        env = [pscustomobject]@{}
+    }
+    if ($configuration.mcpServers.PSObject.Properties["browserai"]) {
+        $configuration.mcpServers.browserai = $browserAiServer
+    } else {
+        $configuration.mcpServers | Add-Member -MemberType NoteProperty -Name browserai -Value $browserAiServer
+    }
+    Write-Host "Browser AI MCP configured: $browserAiMcp"
+}
+
 if ($studioMcp) {
     $robloxServer = [pscustomobject]@{
         command = $studioMcp.FullName

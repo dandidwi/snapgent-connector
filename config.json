@@ -1,0 +1,22 @@
+{
+    "mcpServers":  {
+                       "vscode":  {
+                                      "command":  "C:\\src\\project\\Projek Sendiri\\snapgent-connector-fork\\vscode_mcp.exe",
+                                      "args":  [
+
+                                               ],
+                                      "env":  {
+
+                                              }
+                                  },
+                       "browserai":  {
+                                         "command":  "python",
+                                         "args":  [
+                                                      "C:\\src\\project\\Projek Sendiri\\snapgent-connector-fork\\browser_ai_mcp.py"
+                                                  ],
+                                         "env":  {
+
+                                                 }
+                                     }
+                   }
+}

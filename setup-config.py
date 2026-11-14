@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
 VSCODE_MCP = ROOT / "vscode_mcp.py"
+BROWSER_AI_MCP = ROOT / "browser_ai_mcp.py"
 EFFECTCRAFT_PORT = 9877
 
 
@@ -207,6 +208,12 @@ def main() -> int:
         ).name in {"python", "python3"}:
             _set_server(servers, "vscode", sys.executable, [str(VSCODE_MCP)])
             print(f"VS Code MCP configured: {VSCODE_MCP}")
+
+        # Setup Browser AI MCP
+        browserai = servers.get("browserai")
+        if not isinstance(browserai, dict):
+            _set_server(servers, "browserai", sys.executable, [str(BROWSER_AI_MCP)])
+            print(f"Browser AI MCP configured: {BROWSER_AI_MCP}")
 
         studio_mcp = _roblox_studio_mcp()
         if studio_mcp:
