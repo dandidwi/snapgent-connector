@@ -1,7 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 chcp 65001 >nul
-title Snapgent Bridge
+title Snapgent Local AI Bridge
 cd /d "%~dp0"
 
 if not exist "%~dp0logs" mkdir "%~dp0logs" >nul 2>nul
@@ -16,22 +16,38 @@ if not exist "%~dp0bridge.py" (
     exit /b 1
 )
 
-echo.
-echo   Configuring VS Code MCP and detecting Roblox Studio...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup-config.ps1"
-if errorlevel 1 (
+REM Detect Python 3.9+ without requiring any external pip packages
+set "PY_CMD="
+for %%p in (py python python3) do (
+    where %%p >nul 2>nul
+    if !errorlevel! equ 0 (
+        if "%%p"=="py" (
+            py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)" >nul 2>nul
+            if !errorlevel! equ 0 if not defined PY_CMD set "PY_CMD=py -3"
+        ) else (
+            %%p -c "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)" >nul 2>nul
+            if !errorlevel! equ 0 if not defined PY_CMD set "PY_CMD=%%p"
+        )
+    )
+)
+
+if not defined PY_CMD (
     echo.
-    echo   ERROR: Could not configure the VS Code MCP connection.
-    echo   Check the message above, then run start.bat again.
+    echo   ERROR: Python 3.9 or newer was not found on PATH.
+    echo   Install Python 3 from https://www.python.org/downloads/ and check "Add Python to PATH".
     echo.
     pause
     exit /b 1
 )
 
-if exist "%~dp0start-effectcraft.ps1" (
+if exist "%~dp0setup-config.ps1" (
     echo.
-    echo   Checking EffectCraft control channel...
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start-effectcraft.ps1"
+    echo   Configuring local MCP servers ^(if available^)...
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup-config.ps1" >nul 2>nul
+)
+
+if exist "%~dp0start-effectcraft.ps1" (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start-effectcraft.ps1" >nul 2>nul
 )
 
 set "ZS_BRIDGE_PORT=37613"
@@ -52,14 +68,16 @@ for %%p in (%ZS_BRIDGE_PORT%) do (
 
 echo.
 echo   +------------------------------------------------------+
-echo   ^| Snapgent Local AI Bridge is now running.             ^|
+echo   ^| Snapgent Local AI Bridge ^(Zero-Dependency^)          ^|
 echo   ^| WS Bridge  : ws://127.0.0.1:%ZS_BRIDGE_PORT%                  ^|
 echo   ^| OpenAI API : http://127.0.0.1:%ZS_API_PORT%/v1               ^|
-echo   ^| Minimise it freely - closing it stops the bridge.    ^|
+echo   ^| Ollama API : http://127.0.0.1:%ZS_API_PORT%                  ^|
+echo   ^| No .exe required - Pure Python Standard Library      ^|
+echo   ^| Minimize freely - closing stops the bridge.          ^|
 echo   +------------------------------------------------------+
 echo.
 
-python "%~dp0bridge.py"
+%PY_CMD% "%~dp0bridge.py"
 set "BRIDGE_EXIT=%errorlevel%"
 
 echo.

@@ -1,5 +1,9 @@
 import asyncio
+import base64
+import hashlib
 import json
+import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -46,6 +50,63 @@ for line in sys.stdin:
 """
 
 
+class _RawWSClient:
+    """Minimal RFC 6455 client helper using only Python stdlib for tests."""
+
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.reader = reader
+        self.writer = writer
+
+    @classmethod
+    async def connect(cls, host: str, port: int) -> "_RawWSClient":
+        reader, writer = await asyncio.open_connection(host, port)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        req = (
+            f"GET / HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("ascii")
+        writer.write(req)
+        await writer.drain()
+        raw_head = await reader.readuntil(b"\r\n\r\n")
+        expected_accept = base64.b64encode(
+            hashlib.sha1((key + bridge.WS_GUID).encode("ascii")).digest()
+        ).decode("ascii")
+        assert expected_accept in raw_head.decode("ascii")
+        return cls(reader, writer)
+
+    async def send(self, text: str) -> None:
+        data = text.encode("utf-8")
+        mask = os.urandom(4)
+        length = len(data)
+        if length < 126:
+            header = struct.pack("!BB", 0x81, 0x80 | length)
+        elif length < 65536:
+            header = struct.pack("!BBH", 0x81, 0x80 | 126, length)
+        else:
+            header = struct.pack("!BBQ", 0x81, 0x80 | 127, length)
+        masked = bytes(b ^ mask[i & 3] for i, b in enumerate(data))
+        self.writer.write(header + mask + masked)
+        await self.writer.drain()
+
+    async def recv(self) -> str:
+        b1, b2 = await self.reader.readexactly(2)
+        length = b2 & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", await self.reader.readexactly(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", await self.reader.readexactly(8))[0]
+        payload = await self.reader.readexactly(length)
+        return payload.decode("utf-8")
+
+    async def close(self) -> None:
+        self.writer.close()
+        await self.writer.wait_closed()
+
+
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_stdio_mcp_start_list_call_and_stop(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -66,9 +127,6 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(server.alive)
 
     async def test_large_response_line_is_received(self):
-        # Regression: a single JSON line larger than asyncio's default 64 KB
-        # stream limit used to kill the stdout reader while the process stayed
-        # alive, so every later request timed out.
         with tempfile.TemporaryDirectory() as temp_dir:
             mock_path = Path(temp_dir) / "mock_mcp.py"
             mock_path.write_text(MOCK_MCP, encoding="utf-8")
@@ -87,8 +145,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await server.stop()
 
-    @unittest.skipIf(bridge.websockets is None, "websockets package is not installed")
-    async def test_websocket_extension_protocol(self):
+    async def test_pure_python_websocket_extension_protocol(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             mock_path = root / "mock_mcp.py"
@@ -111,36 +168,39 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             manager = bridge.Bridge()
             with patch.object(bridge, "CONFIG_PATH", config_path):
                 await manager.start_servers()
+                server = await asyncio.start_server(manager.handle_stream, "127.0.0.1", 0)
                 try:
-                    async with bridge.websockets.serve(
-                        manager.handle_client, "127.0.0.1", 0
-                    ) as server:
-                        port = server.sockets[0].getsockname()[1]
-                        async with bridge.websockets.connect(f"ws://127.0.0.1:{port}") as client:
-                            connected = json.loads(await client.recv())
-                            self.assertEqual(connected["type"], "connected")
-                            self.assertEqual(connected["servers"][0]["id"], "mock")
+                    port = server.sockets[0].getsockname()[1]
+                    client = await _RawWSClient.connect("127.0.0.1", port)
+                    try:
+                        connected = json.loads(await client.recv())
+                        self.assertEqual(connected["type"], "connected")
+                        self.assertEqual(connected["servers"][0]["id"], "mock")
 
-                            await client.send(json.dumps({"id": 1, "type": "list_tools"}))
-                            tools = json.loads(await client.recv())
-                            self.assertEqual(tools["type"], "tools")
-                            self.assertEqual(tools["tools"][0]["server"], "mock")
+                        await client.send(json.dumps({"id": 1, "type": "list_tools"}))
+                        tools = json.loads(await client.recv())
+                        self.assertEqual(tools["type"], "tools")
+                        self.assertEqual(tools["tools"][0]["server"], "mock")
 
-                            await client.send(
-                                json.dumps(
-                                    {
-                                        "id": 2,
-                                        "type": "call_tool",
-                                        "name": "echo",
-                                        "arguments": {"message": "round trip"},
-                                        "timeout": 2000,
-                                    }
-                                )
+                        await client.send(
+                            json.dumps(
+                                {
+                                    "id": 2,
+                                    "type": "call_tool",
+                                    "name": "echo",
+                                    "arguments": {"message": "round trip"},
+                                    "timeout": 2000,
+                                }
                             )
-                            result = json.loads(await client.recv())
-                            self.assertTrue(result["ok"])
-                            self.assertEqual(result["text"], "round trip")
+                        )
+                        result = json.loads(await client.recv())
+                        self.assertTrue(result["ok"])
+                        self.assertEqual(result["text"], "round trip")
+                    finally:
+                        await client.close()
                 finally:
+                    server.close()
+                    await server.wait_closed()
                     await manager.stop_servers()
 
     def test_duplicate_tool_names_are_server_qualified(self):

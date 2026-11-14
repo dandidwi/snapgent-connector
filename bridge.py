@@ -1,38 +1,38 @@
 #!/usr/bin/env python3
-"""Cross-platform local WebSocket bridge for Snapgent MCP servers."""
+"""Cross-platform zero-dependency local WebSocket & OpenAI/Ollama proxy bridge for Snapgent."""
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 import os
 import re
 import signal
-import socket
+import struct
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-try:
-    import websockets
-except ImportError:
-    websockets = None
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 
 if getattr(sys, "frozen", False):
-    # PyInstaller build: config.json and logs live next to the .exe, not in the temp extraction dir.
     ROOT = Path(sys.executable).resolve().parent
 else:
     ROOT = Path(__file__).resolve().parent
+
 CONFIG_PATH = ROOT / "config.json"
 LOG_PATH = ROOT / "logs" / "bridge_debug.log"
+RUNTIME_PORTS_PATH = ROOT / "snapgent-extension" / "runtime_ports.json"
 HOST = "127.0.0.1"
-PORT = int(os.environ.get("ZS_BRIDGE_PORT", "17613"))
+PORT = int(os.environ.get("ZS_BRIDGE_PORT", "37613"))
 API_PORT = int(os.environ.get("ZS_API_PORT", "11434"))
 MCP_PROTOCOL_VERSION = "2024-11-05"
-BRIDGE_VERSION = "3.9.4"
+BRIDGE_VERSION = "3.9.5-alpha"
 MAX_LOG_CHARS = 1000
+MAX_WS_PAYLOAD = 50 * 1024 * 1024
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -50,6 +50,167 @@ def log(message: str) -> None:
 
 def _json_line(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+class PureWebSocketConnection:
+    """RFC 6455 compliant server-side WebSocket using pure Python stdlib."""
+
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.reader = reader
+        self.writer = writer
+        self._write_lock = asyncio.Lock()
+        self.closed = False
+
+    async def send(self, data: str) -> None:
+        if self.closed:
+            raise ConnectionResetError("WebSocket is closed")
+        payload = data.encode("utf-8")
+        await self._send_frame(0x1, payload)
+
+    async def _send_frame(self, opcode: int, payload: bytes) -> None:
+        if self.closed:
+            return
+        length = len(payload)
+        if length < 126:
+            header = struct.pack("!BB", 0x80 | opcode, length)
+        elif length < 65536:
+            header = struct.pack("!BBH", 0x80 | opcode, 126, length)
+        else:
+            header = struct.pack("!BBQ", 0x80 | opcode, 127, length)
+        async with self._write_lock:
+            if self.closed:
+                return
+            self.writer.write(header + payload)
+            await self.writer.drain()
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        if self.closed:
+            return
+        try:
+            payload = struct.pack("!H", code) + reason.encode("utf-8")[:123]
+            await self._send_frame(0x8, payload)
+        except Exception:
+            pass
+        self.closed = True
+        try:
+            self.writer.close()
+            await self.writer.wait_closed()
+        except Exception:
+            pass
+
+    async def _read_frame(self) -> Optional[Tuple[bool, int, bytes]]:
+        try:
+            header = await self.reader.readexactly(2)
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
+            return None
+        b1, b2 = header[0], header[1]
+        fin = bool(b1 & 0x80)
+        opcode = b1 & 0x0F
+        masked = bool(b2 & 0x80)
+        length = b2 & 0x7F
+        try:
+            if length == 126:
+                ext = await self.reader.readexactly(2)
+                length = struct.unpack("!H", ext)[0]
+            elif length == 127:
+                ext = await self.reader.readexactly(8)
+                length = struct.unpack("!Q", ext)[0]
+            if length > MAX_WS_PAYLOAD:
+                await self.close(1009, "Message too big")
+                return None
+            mask_key = await self.reader.readexactly(4) if masked else b""
+            payload = await self.reader.readexactly(length) if length > 0 else b""
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
+            return None
+        if masked:
+            payload = bytes(b ^ mask_key[i & 3] for i, b in enumerate(payload))
+        return fin, opcode, payload
+
+    def __aiter__(self) -> AsyncIterator[str]:
+        return self._iter_messages()
+
+    async def _iter_messages(self) -> AsyncIterator[str]:
+        fragments: List[bytes] = []
+        frag_opcode: Optional[int] = None
+        try:
+            while not self.closed:
+                frame = await self._read_frame()
+                if frame is None:
+                    break
+                fin, opcode, payload = frame
+                if opcode == 0x8:
+                    break
+                if opcode == 0x9:
+                    try:
+                        await self._send_frame(0xA, payload)
+                    except Exception:
+                        break
+                    continue
+                if opcode == 0xA:
+                    continue
+                if opcode in (0x1, 0x2):
+                    if fin:
+                        if opcode == 0x1:
+                            yield payload.decode("utf-8", errors="replace")
+                    else:
+                        frag_opcode = opcode
+                        fragments = [payload]
+                elif opcode == 0x0 and frag_opcode is not None:
+                    fragments.append(payload)
+                    if fin:
+                        full_data = b"".join(fragments)
+                        fragments.clear()
+                        if frag_opcode == 0x1:
+                            yield full_data.decode("utf-8", errors="replace")
+                        frag_opcode = None
+        finally:
+            await self.close()
+
+
+async def _perform_ws_handshake(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> Optional[PureWebSocketConnection]:
+    try:
+        raw_head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
+    except Exception:
+        writer.close()
+        return None
+    head_text = raw_head.decode("utf-8", errors="replace")
+    lines = head_text.split("\r\n")
+    if not lines or not lines[0].upper().startswith("GET "):
+        writer.close()
+        return None
+    headers: Dict[str, str] = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    ws_key = headers.get("sec-websocket-key")
+    if not ws_key or headers.get("upgrade", "").lower() != "websocket":
+        body = b"Snapgent Pure-Python WebSocket Bridge"
+        resp = (
+            b"HTTP/1.1 426 Upgrade Required\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n"
+            b"Content-Type: text/plain\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+            + body
+        )
+        writer.write(resp)
+        await writer.drain()
+        writer.close()
+        return None
+    accept_raw = hashlib.sha1((ws_key + WS_GUID).encode("ascii")).digest()
+    accept_key = base64.b64encode(accept_raw).decode("ascii")
+    handshake_resp = (
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Accept: {accept_key}\r\n\r\n"
+    ).encode("ascii")
+    writer.write(handshake_resp)
+    await writer.drain()
+    return PureWebSocketConnection(reader, writer)
 
 
 class MCPServer:
@@ -323,7 +484,6 @@ class Bridge:
             except Exception as error:
                 server.error = str(error)
                 log(f"[{server.server_id}] unexpected startup error: {error}")
-            # Publish each server as soon as it is ready so slow ones do not block the rest.
             self._rebuild_catalog()
             await self.broadcast(self._connected_message())
 
@@ -398,6 +558,12 @@ class Bridge:
             await client.send(_json_line(message))
         except Exception:
             pass
+
+    async def handle_stream(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        ws = await _perform_ws_handshake(reader, writer)
+        if ws is None:
+            return
+        await self.handle_client(ws)
 
     async def handle_client(self, websocket: Any, _path: Optional[str] = None) -> None:
         async with self._client_lock:
@@ -528,9 +694,6 @@ class Bridge:
         except (TypeError, ValueError):
             timeout_seconds = 120.0
         server, tool_name = self._resolve_tool(name)
-        # Isolation: the extension states which server is selected. The bridge refuses to
-        # run a tool that belongs to any other server (requests without the field keep
-        # the old behaviour).
         allowed = request.get("server")
         if isinstance(allowed, str) and allowed:
             if server is None and "/" not in name:
@@ -997,24 +1160,16 @@ async def _handle_http_client(bridge: Bridge, reader: asyncio.StreamReader, writ
 
 
 async def run() -> None:
-    if websockets is None:
-        raise RuntimeError(
-            "The 'websockets' package is required. Install it with "
-            f"'{sys.executable} -m pip install websockets'."
-        )
     bridge = Bridge()
     active_ws_port = PORT
     server = None
     for offset in range(25):
         candidate = PORT + offset
         try:
-            server = await websockets.serve(
-                bridge.handle_client,
+            server = await asyncio.start_server(
+                bridge.handle_stream,
                 HOST,
                 candidate,
-                max_size=50 * 1024 * 1024,
-                ping_interval=20,
-                ping_timeout=20,
             )
             active_ws_port = candidate
             break
@@ -1041,21 +1196,21 @@ async def run() -> None:
         raise RuntimeError(f"Could not bind any HTTP API port starting at {API_PORT}")
 
     try:
-        RUNTIME_PORTS_PATH.write_text(
-            json.dumps({"bridge_port": active_ws_port, "api_port": active_api_port}, indent=2),
-            encoding="utf-8",
-        )
+        if RUNTIME_PORTS_PATH.parent.is_dir():
+            RUNTIME_PORTS_PATH.write_text(
+                json.dumps({"bridge_port": active_ws_port, "api_port": active_api_port}, indent=2) + "\n",
+                encoding="utf-8",
+            )
     except Exception as exc:
         log(f"[warn] failed to write runtime_ports.json: {exc}")
 
-    log(f"snapgent bridge v{BRIDGE_VERSION}")
+    log(f"snapgent bridge v{BRIDGE_VERSION} (zero-dependency pure Python)")
     log(f"listening on ws://{HOST}:{active_ws_port} - load the extension and open a supported AI chat")
     log(f"Local AI API (OpenAI & Ollama compatible) listening on http://{HOST}:{active_api_port}/v1")
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
+
     async def _startup_then_monitor() -> None:
-        # Servers start in parallel after the websocket is already listening;
-        # the monitor only begins once the initial startup has finished.
         try:
             await bridge.start_servers()
         except RuntimeError as error:
@@ -1075,6 +1230,8 @@ async def run() -> None:
         await asyncio.gather(monitor_task, return_exceptions=True)
         server.close()
         await server.wait_closed()
+        api_server.close()
+        await api_server.wait_closed()
         await bridge.stop_servers()
         log("bridge stopped")
 
