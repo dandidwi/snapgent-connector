@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
 VSCODE_MCP = ROOT / "vscode_mcp.py"
+ZED_MCP = ROOT / "zed_mcp.py"
 EFFECTCRAFT_PORT = 9877
 
 
@@ -207,6 +208,21 @@ def main() -> int:
         ).name in {"python", "python3"}:
             _set_server(servers, "vscode", sys.executable, [str(VSCODE_MCP)])
             print(f"VS Code MCP configured: {VSCODE_MCP}")
+
+        if ZED_MCP.is_file():
+            zed = servers.get("zed")
+            if not isinstance(zed, dict) or Path(str(zed.get("command", ""))).name in {
+                "",
+                "zed_mcp.exe",
+                "zed_mcp.py",
+            }:
+                _set_server(servers, "zed", sys.executable, [str(ZED_MCP)])
+                print(f"Zed MCP configured: {ZED_MCP}")
+            elif not Path(str(zed.get("command", ""))).exists() and Path(
+                str(zed.get("command", ""))
+            ).name in {"python", "python3"}:
+                _set_server(servers, "zed", sys.executable, [str(ZED_MCP)])
+                print(f"Zed MCP configured: {ZED_MCP}")
 
         studio_mcp = _roblox_studio_mcp()
         if studio_mcp:

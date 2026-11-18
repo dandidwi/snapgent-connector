@@ -25,6 +25,10 @@ if (-not (Test-Path -LiteralPath $vscodeMcp -PathType Leaf)) {
     throw "VS Code MCP was not found at '$vscodeMcp'. Extract the whole release, then run start.bat again."
 }
 
+$zedMcpExe = Join-Path $PSScriptRoot "zed_mcp.exe"
+$zedMcpPy = Join-Path $PSScriptRoot "zed_mcp.py"
+$zedPython = Get-Command python.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+
 $studioMcp = Get-ChildItem -Path (Join-Path $RobloxVersionsPath "version-*\StudioMCP.exe") -File -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
@@ -196,6 +200,35 @@ elseif ($reaNode -and $reaScript) {
 }
 else {
     Write-Host "REA not found; install it with: npm install --global rea-agents"
+}
+
+if (Test-Path -LiteralPath $zedMcpExe -PathType Leaf) {
+    $zedServer = [pscustomobject]@{
+        command = $zedMcpExe
+        args = @()
+        env = [pscustomobject]@{}
+    }
+    if ($configuration.mcpServers.PSObject.Properties["zed"]) {
+        $configuration.mcpServers.zed = $zedServer
+    }
+    else {
+        $configuration.mcpServers | Add-Member -MemberType NoteProperty -Name zed -Value $zedServer
+    }
+    Write-Host "Zed MCP detected: $zedMcpExe"
+}
+elseif ($zedPython -and (Test-Path -LiteralPath $zedMcpPy -PathType Leaf)) {
+    $zedServer = [pscustomobject]@{
+        command = $zedPython.Source
+        args = @($zedMcpPy)
+        env = [pscustomobject]@{}
+    }
+    if ($configuration.mcpServers.PSObject.Properties["zed"]) {
+        $configuration.mcpServers.zed = $zedServer
+    }
+    else {
+        $configuration.mcpServers | Add-Member -MemberType NoteProperty -Name zed -Value $zedServer
+    }
+    Write-Host "Zed MCP configured: $zedMcpPy"
 }
 
 $json = ConvertTo-Json -InputObject $configuration -Depth 20

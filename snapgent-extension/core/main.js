@@ -2147,12 +2147,6 @@
   // ════════════════════════════════════════════════════════════════════════
   async function startSession() {
     if (A.running || A.starting) return;
-    // "Start session" is allowed ONLY on a blank conversation. Opening an
-    // EXISTING conversation must never trigger the bootstrap.
-    if (!P.chatIsEmpty() && !A.started) {
-      ui.toast("Use an empty chat.");
-      return;
-    }
     A.userStopped = false;
     A.stop = false;               // clear any halt left by a prior aborted bootstrap
     // Snapshot any turn already on screen at session start (normally none on a
@@ -3077,7 +3071,7 @@
     // (set by renderBar via actionBtn.dataset.kind).
     function onActionClick() {
       const kind = actionBtn.dataset.kind;
-      if (kind === "start" || kind === "start-degraded") startSession();
+      if (kind === "start" || kind === "start-degraded" || kind === "reconnect") startSession();
     }
 
     // ── Custom prompt (persisted) ───────────────────────────────────────────
@@ -3139,6 +3133,7 @@
     function getTargetName(id = selectedTargetId) {
       if (id === "roblox") return "Roblox Studio";
       if (id === "vscode") return "VS Code";
+      if (id === "zed") return "Zed";
       if (id === "effectcraft") return "EffectCraft";
       const server = mergedMcpServers().find((item) => item.id === id);
       return server ? server.name : id;
@@ -3634,8 +3629,30 @@
         }
         if (selectedTargetId === "roblox") disabled = !bridgeOk && !addonOk;
       } else {
-        toneClass = "noagent";
-        msg = `No agent. Open a new chat.`;
+        const selectedServer = (A.bridge.servers || []).find((item) => item.id === selectedTargetId);
+        const vscodeWorkspaceMissing = selectedTargetId === "vscode" &&
+          !!A.bridge.connected && !!selectedServer && !!selectedServer.alive &&
+          !(selectedServer.tools > 0);
+        if (selectedTargetId !== "roblox" &&
+            (!bridgeOk || (selectedTargetId === "vscode" && !workspaceReady))) {
+          toneClass = "warn"; warn = true;
+          msg = !A.bridge.connected
+            ? `Run <b>start.bat</b>`
+            : selectedTargetId === "vscode" && (bridgeOk || vscodeWorkspaceMissing)
+              ? workspaceProbePending
+                ? `Checking <b>VS Code workspace</b>â€¦`
+                : `Open a <b>folder in VS Code</b>`
+              : `<b>${targetNameHtml()} unavailable</b>`;
+          label = `â–¶ï¸Ž Reconnect`; kind = "reconnect"; disabled = true;
+        } else if (bridgeOk && (selectedTargetId !== "vscode" || workspaceReady)) {
+          toneClass = "noagent";
+          msg = `Session detached.`;
+          label = `â–¶ï¸Ž Reconnect`; kind = "reconnect"; disabled = false;
+        } else {
+          toneClass = "warn"; warn = true;
+          msg = !A.bridge.connected ? `Run <b>start.bat</b>` : `Target offline`;
+          label = `â–¶ï¸Ž Reconnect`; kind = "reconnect"; disabled = true;
+        }
       }
       // Parked on visibility: the loop is alive but deliberately frozen because
       // this tab is not the foreground tab of its window. Say so explicitly -
